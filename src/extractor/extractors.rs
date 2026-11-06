@@ -8,26 +8,56 @@ use super::{KeyProjection, errors::KeyExtractError};
 use crate::{
     inmem::immutable::memtable::{MVCC_COMMIT_COL, MVCC_TOMBSTONE_COL},
     key::{KeyRow, KeyRowError},
+    mode::find_matching_field_index,
 };
 
-fn schemas_compatible(expected: &Schema, actual: &Schema) -> bool {
+fn schemas_compatible(expected: &Schema, actual: &Schema, key_columns: &[usize]) -> bool {
     if expected == actual {
         return true;
     }
-    // Allow actual to have one extra trailing `_commit_ts` column (UInt64, non-nullable)
-    if actual.fields().len() == expected.fields().len() + 1 {
-        let (head_actual, tail_actual) = actual.fields().split_at(expected.fields().len());
-        let heads_match = head_actual
+
+    let actual_fields = if actual.fields().last().is_some_and(|last| {
+        last.name() == MVCC_COMMIT_COL
+            && last.data_type() == &DataType::UInt64
+            && !last.is_nullable()
+    }) && actual.fields().len() > expected.fields().len()
+    {
+        &actual.fields()[..actual.fields().len() - 1]
+    } else {
+        &actual.fields()[..]
+    };
+
+    if actual_fields.len() == expected.fields().len()
+        && actual_fields
             .iter()
             .zip(expected.fields().iter())
-            .all(|(a, b)| a.as_ref() == b.as_ref());
-        if heads_match && let Some(last) = tail_actual.first() {
-            return last.name() == MVCC_COMMIT_COL
-                && last.data_type() == &DataType::UInt64
-                && !last.is_nullable();
+            .all(|(a, b)| a.as_ref() == b.as_ref())
+    {
+        return true;
+    }
+
+    // Allow evolved schemas that preserve all primary key columns at their original indices and
+    // keep matching data types for any shared columns while adding only nullable user columns.
+    for &key_idx in key_columns {
+        let Some(actual_key) = actual_fields.get(key_idx) else {
+            return false;
+        };
+        if actual_key.as_ref() != expected.field(key_idx) {
+            return false;
         }
     }
-    false
+
+    for actual_field in actual_fields {
+        if let Some(expected_idx) = find_matching_field_index(expected, actual_field.as_ref()) {
+            if expected.field(expected_idx).data_type() != actual_field.data_type() {
+                return false;
+            }
+        } else if actual_field.name() == MVCC_TOMBSTONE_COL || !actual_field.is_nullable() {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Build a boxed key projection for a single column.
@@ -84,7 +114,11 @@ impl DynKeyProjection {
     }
 
     fn ensure_batch_schema(&self, batch_schema: &SchemaRef) -> Result<(), KeyExtractError> {
-        if schemas_compatible(self.schema.as_ref(), batch_schema.as_ref()) {
+        if schemas_compatible(
+            self.schema.as_ref(),
+            batch_schema.as_ref(),
+            &self.key_columns,
+        ) {
             Ok(())
         } else {
             Err(KeyExtractError::SchemaMismatch {

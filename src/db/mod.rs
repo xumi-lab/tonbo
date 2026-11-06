@@ -54,6 +54,7 @@ pub use crate::{
         planner::{CompactionStrategy, LeveledPlannerConfig},
     },
     inmem::policy::{BatchesThreshold, NeverSeal, SealPolicy},
+    manifest::{ManifestError, ManifestFs, TableId, TableMeta, TonboManifest},
     mode::DynModeConfig,
     query::{Expr, ScalarValue},
     schema::SchemaBuilder,
@@ -65,10 +66,7 @@ use crate::{
     id::FileId,
     inmem::mutable::DynMem,
     key::KeyOwned,
-    manifest::{
-        ManifestError, ManifestFs, SstEntry, TableId, TableMeta, TonboManifest, VersionEdit,
-        VersionState, WalSegmentRef,
-    },
+    manifest::{SstEntry, VersionEdit, VersionState, WalSegmentRef},
     mvcc::{CommitClock, ReadView, Timestamp},
     ondisk::{
         bloom::{BloomFilterCache, default_bloom_cache},
@@ -312,6 +310,10 @@ impl MinorCompactionState {
         }
     }
 
+    fn set_schema(&self, schema: SchemaRef) {
+        self.config.set_schema(schema);
+    }
+
     async fn maybe_compact<FS, E>(
         &self,
         db: &DbInner<FS, E>,
@@ -514,7 +516,7 @@ where
         } else {
             TransactionDurability::Volatile
         };
-        let schema = handle.schema.clone();
+        let schema = handle.current_schema();
         let delete_schema = handle.delete_schema.clone();
         let extractor = Arc::clone(handle.extractor());
         let commit_ack_mode = handle.commit_ack_mode;
@@ -527,6 +529,47 @@ where
             commit_ack_mode,
             durability,
         ))
+    }
+
+    /// Return the current Arrow schema for this table.
+    pub fn schema(&self) -> SchemaRef {
+        self.inner.current_schema()
+    }
+
+    /// Return the current logical schema version registered in the manifest for this table.
+    pub fn schema_version(&self) -> u32 {
+        self.inner.current_table_meta().schema_version
+    }
+
+    /// Return the table identifier assigned by the manifest catalog.
+    pub fn table_id(&self) -> TableId {
+        self.inner.manifest_table
+    }
+
+    /// Return the latest table metadata registered in the manifest catalog.
+    pub fn table_meta(&self) -> TableMeta {
+        self.inner.current_table_meta()
+    }
+
+    /// Access the underlying manifest handle for this database.
+    pub fn manifest(&self) -> &TonboManifest<FS, E> {
+        &self.inner.manifest
+    }
+
+    /// Evolve the table schema online to a newer `schema_version` without rewriting existing
+    /// SSTables.
+    ///
+    /// Existing primary key columns and their positions must remain unchanged, existing user
+    /// columns that remain present must keep their `DataType`, and newly added columns must be
+    /// nullable so historical rows and SSTables can be backfilled with `NULL` values on read.
+    pub async fn evolve_schema(
+        &self,
+        new_schema: SchemaRef,
+        new_schema_version: u32,
+    ) -> Result<TableMeta, DBError> {
+        self.inner
+            .evolve_schema(new_schema, new_schema_version)
+            .await
     }
 
     /// Begin constructing a DB through the fluent builder API.
@@ -738,6 +781,7 @@ where
     E: Executor + Timer + Clone + 'static,
     <FS as fusio::fs::Fs>::File: fusio::durability::FileCommit,
 {
+    #[allow(dead_code)]
     pub(crate) schema: SchemaRef,
     pub(crate) delete_schema: SchemaRef,
     pub(crate) commit_ack_mode: CommitAckMode,
@@ -759,7 +803,7 @@ where
     wal_config: Option<RuntimeWalConfig>,
     /// Static table metadata registered in the manifest (cached to survive transient catalog
     /// misses).
-    table_meta: TableMeta,
+    table_meta: parking_lot::RwLock<TableMeta>,
     /// Monotonic commit timestamp assigned to ingests (autocommit path for now).
     commit_clock: CommitClock,
     /// Manifest handle with concrete filesystem type for static dispatch.
@@ -779,6 +823,8 @@ where
     _key_locks: LockMap<KeyOwned>,
     /// Optional background compaction worker handle.
     compaction_worker: Option<CompactionHandle<E>>,
+    /// Optional SSTable configuration shared with the background compaction worker.
+    compaction_sst_config: Option<Arc<SsTableConfig>>,
     /// Optional compaction metrics observer.
     compaction_metrics: Option<Arc<crate::compaction::metrics::CompactionMetrics>>,
     /// Async gate to serialize flushes triggered by minor compaction or manual calls.
@@ -809,6 +855,7 @@ where
     E: Executor + Timer + Clone + 'static,
     <FS as fusio::fs::Fs>::File: fusio::durability::FileCommit,
 {
+    #[allow(dead_code)]
     pub(crate) schema: SchemaRef,
     pub(crate) delete_schema: SchemaRef,
     pub(crate) commit_ack_mode: CommitAckMode,
@@ -830,7 +877,7 @@ where
     wal_config: Option<RuntimeWalConfig>,
     /// Static table metadata registered in the manifest (cached to survive transient catalog
     /// misses).
-    table_meta: TableMeta,
+    table_meta: parking_lot::RwLock<TableMeta>,
     /// Monotonic commit timestamp assigned to ingests (autocommit path for now).
     commit_clock: CommitClock,
     /// Manifest handle with concrete filesystem type for static dispatch.
@@ -850,6 +897,8 @@ where
     _key_locks: LockMap<KeyOwned>,
     /// Optional background compaction worker handle.
     compaction_worker: Option<CompactionHandle<E>>,
+    /// Optional SSTable configuration shared with the background compaction worker.
+    compaction_sst_config: Option<Arc<SsTableConfig>>,
     /// Optional compaction metrics observer.
     compaction_metrics: Option<Arc<crate::compaction::metrics::CompactionMetrics>>,
     /// Async gate to serialize flushes triggered by minor compaction or manual calls.
@@ -884,6 +933,88 @@ where
     /// Access the key extractor for this DB.
     pub(crate) fn extractor(&self) -> &Arc<dyn KeyProjection> {
         self.mem.extractor()
+    }
+
+    /// Return the current Arrow schema for this table.
+    pub(crate) fn current_schema(&self) -> SchemaRef {
+        self.mem.schema()
+    }
+
+    /// Return the latest cached [`TableMeta`] for this table.
+    pub(crate) fn current_table_meta(&self) -> TableMeta {
+        self.table_meta.read().clone()
+    }
+
+    /// Evolve the table schema online to a newer `schema_version`.
+    pub(crate) async fn evolve_schema(
+        &self,
+        new_schema: SchemaRef,
+        new_schema_version: u32,
+    ) -> Result<TableMeta, DBError> {
+        let current_meta = self.current_table_meta();
+        if new_schema_version <= current_meta.schema_version {
+            return Err(DBError::Manifest(ManifestError::CatalogConflict(
+                "evolve_schema requires a strictly newer schema_version".to_string(),
+            )));
+        }
+        self.extractor()
+            .validate_schema(&new_schema)
+            .map_err(DBError::Key)?;
+        let current_schema = self.current_schema();
+        for new_field in new_schema.fields() {
+            if let Some(existing_idx) =
+                crate::mode::find_matching_field_index(&current_schema, new_field)
+            {
+                if current_schema.field(existing_idx).data_type() != new_field.data_type() {
+                    return Err(DBError::Key(KeyExtractError::SchemaMismatch {
+                        expected: current_schema,
+                        actual: new_schema,
+                    }));
+                }
+            } else if !new_field.is_nullable() {
+                return Err(DBError::Key(KeyExtractError::SchemaMismatch {
+                    expected: current_schema,
+                    actual: new_schema,
+                }));
+            }
+        }
+
+        let definition = crate::manifest::TableDefinition {
+            name: current_meta.name.clone(),
+            schema_fingerprint: crate::mode::fingerprint_schema(&new_schema),
+            primary_key_columns: current_meta.primary_key_columns.clone(),
+            schema_version: new_schema_version,
+        };
+        let updated_meta = self
+            .manifest
+            .register_table(&crate::id::FileIdGenerator::default(), &definition)
+            .await
+            .map_err(DBError::Manifest)?;
+
+        self.mem
+            .evolve_schema(Arc::clone(&new_schema))
+            .map_err(DBError::Key)?;
+
+        {
+            let mut seal = self.seal_state_lock();
+            let mut adapted = Vec::with_capacity(seal.immutables.len());
+            for seg in &seal.immutables {
+                adapted.push(Arc::new(
+                    seg.with_adapted_schema(&new_schema).map_err(DBError::Key)?,
+                ));
+            }
+            seal.immutables = adapted;
+        }
+
+        if let Some(minor) = &self.minor_compaction {
+            minor.set_schema(Arc::clone(&new_schema));
+        }
+        if let Some(sst_config) = &self.compaction_sst_config {
+            sst_config.set_schema(Arc::clone(&new_schema));
+        }
+
+        *self.table_meta.write() = updated_meta.clone();
+        Ok(updated_meta)
     }
 
     /// Access the delete sidecar key extractor for this DB.
@@ -938,7 +1069,7 @@ where
     #[cfg(all(test, feature = "tokio"))]
     pub(crate) fn set_mem_capacity(&mut self, capacity: usize) {
         self.mem = DynMem::with_capacity(
-            self.schema.clone(),
+            self.current_schema(),
             Arc::clone(self.mem.extractor()),
             Arc::clone(self.mem.delete_projection()),
             capacity,
@@ -980,7 +1111,7 @@ where
             sst_root,
             wal: None,
             wal_config,
-            table_meta,
+            table_meta: parking_lot::RwLock::new(table_meta),
             commit_clock: CommitClock::default(),
             manifest,
             manifest_table,
@@ -991,6 +1122,7 @@ where
             mutable_wal_range: Arc::new(Mutex::new(None)),
             _key_locks: Arc::new(LockableHashMap::new()),
             compaction_worker: None,
+            compaction_sst_config: None,
             compaction_metrics: None,
             flush_lock: AsyncMutex::new(()),
             minor_compaction: None,
@@ -1112,12 +1244,11 @@ where
         batch: RecordBatch,
         run_minor_compaction: bool,
     ) -> Result<(), KeyExtractError> {
-        if self.schema.as_ref() != batch.schema().as_ref() {
-            return Err(KeyExtractError::SchemaMismatch {
-                expected: self.schema.clone(),
-                actual: batch.schema(),
-            });
-        }
+        let batch = crate::mode::align_ingest_batch_to_schema(
+            batch,
+            &self.current_schema(),
+            &self.extractor().key_schema(),
+        )?;
 
         self.apply_l0_backpressure().await?;
 
@@ -1169,9 +1300,10 @@ where
 
     /// Open a read-only snapshot pinned to the current manifest head.
     pub async fn begin_snapshot(&self) -> Result<TxSnapshot, SnapshotError> {
+        let table_meta = self.current_table_meta();
         let manifest_snapshot = self
             .manifest
-            .snapshot_latest_with_fallback(self.manifest_table, &self.table_meta)
+            .snapshot_latest_with_fallback(self.manifest_table, &table_meta)
             .await?;
         let manifest_pin = self.snapshot_pin_for_manifest(&manifest_snapshot);
         let next_ts = self.commit_clock.peek();
@@ -1234,9 +1366,10 @@ where
         } else if versions.is_empty() {
             // No committed manifest versions exist yet, so only the current in-memory/head view can
             // answer the request.
+            let table_meta = self.current_table_meta();
             let manifest_snapshot = self
                 .manifest
-                .snapshot_latest_with_fallback(self.manifest_table, &self.table_meta)
+                .snapshot_latest_with_fallback(self.manifest_table, &table_meta)
                 .await?;
             let manifest_pin = self.snapshot_pin_for_manifest(&manifest_snapshot);
             (manifest_snapshot, manifest_pin)
@@ -1283,9 +1416,10 @@ where
             .list_versions(self.manifest_table, limit)
             .await?;
         if states.is_empty() {
+            let table_meta = self.current_table_meta();
             let snapshot = self
                 .manifest
-                .snapshot_latest_with_fallback(self.manifest_table, &self.table_meta)
+                .snapshot_latest_with_fallback(self.manifest_table, &table_meta)
                 .await?;
             if let Some(latest) = snapshot.latest_version {
                 states.push(latest);
@@ -1306,9 +1440,10 @@ where
     }
 
     async fn l0_stats_from_manifest(&self) -> Result<L0Stats, ManifestError> {
+        let table_meta = self.current_table_meta();
         let snapshot = self
             .manifest
-            .snapshot_latest_with_fallback(self.manifest_table, &self.table_meta)
+            .snapshot_latest_with_fallback(self.manifest_table, &table_meta)
             .await?;
         let Some(version) = snapshot.latest_version else {
             return Ok(L0Stats {

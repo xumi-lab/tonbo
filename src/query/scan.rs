@@ -18,6 +18,7 @@ use crate::{
     extractor::KeyExtractError,
     key::KeyOwned,
     manifest::{SstEntry, TableSnapshot},
+    mode::find_matching_field_index,
     mvcc::Timestamp,
     query::{Expr, KeyPredicateValue, ScalarValue},
 };
@@ -642,6 +643,22 @@ fn extend_projection_schema(
     projection: &SchemaRef,
     required: &BTreeSet<String>,
 ) -> Result<SchemaRef, KeyExtractError> {
+    for proj_field in projection.fields() {
+        let Some(base_idx) = find_matching_field_index(base_schema.as_ref(), proj_field.as_ref())
+        else {
+            return Err(KeyExtractError::NoSuchField {
+                name: proj_field.name().to_string(),
+            });
+        };
+        if base_schema.field(base_idx).data_type() != proj_field.data_type() {
+            return Err(KeyExtractError::WrongType {
+                col: base_idx,
+                expected: proj_field.data_type().clone(),
+                actual: base_schema.field(base_idx).data_type().clone(),
+            });
+        }
+    }
+
     if required.is_empty()
         || required.iter().all(|name| {
             projection
@@ -653,30 +670,30 @@ fn extend_projection_schema(
         return Ok(Arc::clone(projection));
     }
 
-    let mut needed: BTreeSet<String> = projection
-        .fields()
-        .iter()
-        .map(|field| field.name().to_string())
-        .collect();
-    needed.extend(required.iter().cloned());
-
-    let mut fields = Vec::new();
-    for field in base_schema.fields() {
-        if needed.remove(field.name()) {
-            fields.push(field.clone());
+    let mut fields: Vec<Arc<arrow_schema::Field>> = projection.fields().iter().cloned().collect();
+    for req_name in required {
+        if fields.iter().any(|field| field.name() == req_name.as_str()) {
+            continue;
         }
-    }
-
-    if !needed.is_empty() {
-        // TODO: add nested-column support once predicates can address nested fields.
-        if let Some(missing) = needed.iter().next() {
+        // Pick the latest matching field by name in `base_schema` so evolved columns shadow
+        // earlier dropped columns of the same name when referenced by a predicate.
+        let Some(found) = base_schema
+            .fields()
+            .iter()
+            .rev()
+            .find(|field| field.name() == req_name.as_str())
+        else {
             return Err(KeyExtractError::NoSuchField {
-                name: missing.to_string(),
+                name: req_name.to_string(),
             });
-        }
+        };
+        fields.push(Arc::clone(found));
     }
 
-    Ok(Arc::new(Schema::new(fields)))
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        projection.metadata().clone(),
+    )))
 }
 
 fn collect_predicate_columns(predicate: &Expr, out: &mut BTreeSet<String>) {

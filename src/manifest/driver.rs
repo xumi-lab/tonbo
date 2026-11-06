@@ -418,9 +418,28 @@ where
     ) -> ManifestResult<()> {
         let mut session = self.inner.session_write().await?;
         let key = VersionKey::TableHead { table_id };
-        if session.get(&key).await?.is_some() {
-            session.end().await?;
-            return Ok(());
+        if let Some(value) = session.get(&key).await? {
+            <VersionCodec as ManifestCodec>::validate_key_value(&key, &value)?;
+            let mut existing = TableHead::try_from(value)?;
+            match head.schema_version.cmp(&existing.schema_version) {
+                std::cmp::Ordering::Less => {
+                    session.end().await?;
+                    return Err(ManifestError::CatalogConflict(format!(
+                        "table `{table_id:?}` schema version regression in head (existing={}, requested={})",
+                        existing.schema_version, head.schema_version
+                    )));
+                }
+                std::cmp::Ordering::Equal => {
+                    session.end().await?;
+                    return Ok(());
+                }
+                std::cmp::Ordering::Greater => {
+                    existing.schema_version = head.schema_version;
+                    session.put(key, VersionValue::TableHead(existing));
+                    session.commit().await?;
+                    return Ok(());
+                }
+            }
         }
         session.put(key, VersionValue::TableHead(head));
         session.commit().await?;
@@ -696,11 +715,24 @@ where
                     "catalog entry missing corresponding table metadata",
                 ))?;
             <CatalogCodec as ManifestCodec>::validate_key_value(&meta_key, &value)?;
-            let meta = TableMeta::try_from(value)?;
-            let compat = ensure_table_compat(&meta, definition);
-            session.end().await?;
-            compat?;
-            return Ok(meta);
+            let mut meta = TableMeta::try_from(value)?;
+            match ensure_table_compat(&meta, definition) {
+                Ok(false) => {
+                    session.end().await?;
+                    return Ok(meta);
+                }
+                Ok(true) => {
+                    meta.schema_fingerprint = definition.schema_fingerprint.clone();
+                    meta.schema_version = definition.schema_version;
+                    session.put(meta_key, CatalogValue::TableMeta(meta.clone()));
+                    session.commit().await?;
+                    return Ok(meta);
+                }
+                Err(err) => {
+                    session.end().await?;
+                    return Err(err);
+                }
+            }
         }
 
         let table_id = TableId::new(file_ids);
@@ -751,6 +783,26 @@ where
         session.end().await?;
         Ok(meta)
     }
+
+    #[instrument(
+        name = "manifest::list_tables",
+        skip(self),
+        fields(component = "manifest")
+    )]
+    pub(crate) async fn list_tables(&self) -> ManifestResult<Vec<TableId>> {
+        let session = self.inner.session_read().await?;
+        let root_key = CatalogKey::Root;
+        let tables = match session.get(&root_key).await? {
+            Some(value) => {
+                <CatalogCodec as ManifestCodec>::validate_key_value(&root_key, &value)?;
+                let catalog = CatalogState::try_from(value)?;
+                catalog.tables.keys().copied().collect()
+            }
+            None => Vec::new(),
+        };
+        session.end().await?;
+        Ok(tables)
+    }
 }
 
 impl<C, HS, SS, CS, LS, E> Clone for Manifest<C, HS, SS, CS, LS, E>
@@ -776,26 +828,29 @@ fn find_table_by_name(state: &CatalogState, name: &str) -> Option<TableId> {
         .find_map(|(id, entry)| (entry.logical_table_name == name).then_some(*id))
 }
 
-fn ensure_table_compat(meta: &TableMeta, definition: &TableDefinition) -> ManifestResult<()> {
-    if meta.schema_fingerprint != definition.schema_fingerprint {
-        return Err(ManifestError::CatalogConflict(format!(
-            "table `{}` schema fingerprint mismatch (existing={}, requested={})",
-            definition.name, meta.schema_fingerprint, definition.schema_fingerprint
-        )));
-    }
+fn ensure_table_compat(meta: &TableMeta, definition: &TableDefinition) -> ManifestResult<bool> {
     if meta.primary_key_columns != definition.primary_key_columns {
         return Err(ManifestError::CatalogConflict(format!(
             "table `{}` primary key columns mismatch (existing={:?}, requested={:?})",
             definition.name, meta.primary_key_columns, definition.primary_key_columns
         )));
     }
-    if meta.schema_version != definition.schema_version {
-        return Err(ManifestError::CatalogConflict(format!(
-            "table `{}` schema version mismatch (existing={}, requested={})",
+    match definition.schema_version.cmp(&meta.schema_version) {
+        std::cmp::Ordering::Less => Err(ManifestError::CatalogConflict(format!(
+            "table `{}` schema version regression (existing={}, requested={})",
             definition.name, meta.schema_version, definition.schema_version
-        )));
+        ))),
+        std::cmp::Ordering::Equal => {
+            if meta.schema_fingerprint != definition.schema_fingerprint {
+                return Err(ManifestError::CatalogConflict(format!(
+                    "table `{}` schema fingerprint mismatch (existing={}, requested={})",
+                    definition.name, meta.schema_fingerprint, definition.schema_fingerprint
+                )));
+            }
+            Ok(false)
+        }
+        std::cmp::Ordering::Greater => Ok(true),
     }
-    Ok(())
 }
 
 #[cfg(all(test, feature = "tokio"))]

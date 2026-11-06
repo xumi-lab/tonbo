@@ -416,7 +416,8 @@ impl OutputState {
     where
         E: Executor + Clone,
     {
-        self.flush_chunk(config.schema())?;
+        let current_schema = config.current_schema();
+        self.flush_chunk(&current_schema)?;
 
         let mut writer = ParquetTableWriter::new(Arc::clone(config), descriptor);
         if !wal_ids.is_empty() {
@@ -750,7 +751,8 @@ impl SsTableMerger {
             }
 
             if output_state.should_flush_chunk(chunk_rows) {
-                output_state.flush_chunk(self.config.schema())?;
+                let current_schema = self.config.current_schema();
+                output_state.flush_chunk(&current_schema)?;
             }
 
             if output_state.exceeds_caps(self.max_output_rows, self.max_output_bytes) {

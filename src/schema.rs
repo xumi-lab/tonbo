@@ -10,6 +10,7 @@ use std::sync::Arc;
 use arrow_schema::{Schema, SchemaRef};
 use serde_json::json;
 
+pub use crate::mode::TONBO_FIELD_ID_META_KEY;
 use crate::{
     extractor::{self, KeyExtractError},
     mode::DynModeConfig,

@@ -251,14 +251,18 @@ impl<'a> TransactionScan<'a> {
         let input_dyn_schema = DynSchema::from_ref(Arc::clone(schema));
         let (fields, projection) = match projection_schema {
             Some(target) => {
-                let projection = if target.as_ref() == schema.as_ref() {
-                    None
-                } else {
-                    Some(DynProjection::from_schema(
-                        schema.as_ref(),
-                        target.as_ref(),
-                    )?)
-                };
+                let projection =
+                    if target.as_ref() == schema.as_ref() {
+                        None
+                    } else {
+                        let indices = crate::mode::schema_projection_indices(schema, target)
+                            .map_err(|err| DynViewError::Invalid {
+                                column: 0,
+                                path: "transaction_scan_projection".to_string(),
+                                message: err.to_string(),
+                            })?;
+                        Some(DynProjection::from_indices(schema.as_ref(), indices)?)
+                    };
                 (target.fields().clone(), projection)
             }
             None => (schema.fields().clone(), None),

@@ -10,6 +10,7 @@ use std::{
 };
 
 use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_schema::SchemaRef;
 use fusio::executor::Executor;
 use fusio_parquet::reader::AsyncReader;
 use futures::{Stream, ready};
@@ -83,6 +84,7 @@ use crate::{
     extractor::{KeyExtractError, KeyProjection},
     inmem::immutable::memtable::{MVCC_COMMIT_COL, MvccColumns},
     key::{KeyOwned, KeyTsOwned, KeyTsViewRaw},
+    mode::adapt_record_batch_to_schema,
     mvcc::Timestamp,
     query::stream::Order,
 };
@@ -214,6 +216,7 @@ pin_project! {
         peeked_data: Option<DataEntry>,
         peeked_delete: Option<DeleteEntry>,
         projection_indices: Vec<usize>,
+        target_batch_schema: Option<SchemaRef>,
         data_extractor: Arc<dyn KeyProjection>,
         delete_extractor: Option<Arc<dyn KeyProjection>>,
         order: Option<Order>,
@@ -260,6 +263,7 @@ where
             peeked_data: None,
             peeked_delete: None,
             projection_indices,
+            target_batch_schema: None,
             data_extractor,
             delete_extractor,
             order,
@@ -267,6 +271,13 @@ where
             current_key: None,
             emitted_for_key: false,
         }
+    }
+
+    /// Specify the target projected batch schema so batches read from older SSTables can backfill
+    /// missing columns with null arrays before key/row projection.
+    pub(crate) fn with_target_batch_schema(mut self, schema: SchemaRef) -> Self {
+        self.target_batch_schema = Some(schema);
+        self
     }
 }
 
@@ -288,6 +299,7 @@ where
                     this.data_iter,
                     &*this.data_extractor,
                     this.projection_indices,
+                    this.target_batch_schema.as_ref(),
                     *this.order,
                     *this.read_ts,
                     cx,
@@ -454,11 +466,13 @@ fn process_delete_entry(
 }
 
 /// Poll for the next visible data entry from the data stream.
+#[allow(clippy::too_many_arguments)]
 fn poll_next_data_entry<E: Executor + Clone + 'static>(
     mut data_stream: Pin<&mut ParquetStream<E>>,
     data_iter: &mut Option<DataBatchIterator>,
     extractor: &Arc<dyn KeyProjection>,
     projection_indices: &[usize],
+    target_batch_schema: Option<&SchemaRef>,
     order: Option<Order>,
     read_ts: Timestamp,
     cx: &mut Context<'_>,
@@ -488,11 +502,20 @@ fn poll_next_data_entry<E: Executor + Clone + 'static>(
         }
 
         // Need to fetch next batch
-        let batch = match ready!(data_stream.as_mut().poll_next(cx)).transpose() {
+        let mut batch = match ready!(data_stream.as_mut().poll_next(cx)).transpose() {
             Ok(Some(b)) => b,
             Ok(None) => return Poll::Ready(None), // Stream exhausted
             Err(e) => return Poll::Ready(Some(Err(SstableScanError::Parquet(e)))),
         };
+
+        if let Some(target_schema) = target_batch_schema
+            && batch.schema().as_ref() != target_schema.as_ref()
+        {
+            batch = match adapt_record_batch_to_schema(&batch, target_schema) {
+                Ok(adapted) => adapted,
+                Err(e) => return Poll::Ready(Some(Err(SstableScanError::Key(e)))),
+            };
+        }
 
         let mvcc = match decode_mvcc_from_data(&batch) {
             Ok(m) => m,

@@ -6,6 +6,7 @@ mod ingest;
 mod metadata;
 mod recovery;
 mod scan;
+mod schema_evolution;
 mod seal_policy;
 mod wal;
 mod wal_pruning;

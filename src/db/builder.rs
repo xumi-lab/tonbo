@@ -1188,6 +1188,7 @@ where
         if let (Some(options), Some((sst_config, id_allocator))) =
             (compaction_options, compaction_state)
         {
+            inner.compaction_sst_config = Some(Arc::clone(&sst_config));
             let planner = options.strategy.clone().build();
             let mut exec =
                 LocalCompactionExecutor::with_id_allocator(Arc::clone(&sst_config), id_allocator);
@@ -1219,6 +1220,13 @@ impl<S> DbBuilder<S> {
     #[must_use]
     pub fn with_commit_ack_mode(mut self, mode: CommitAckMode) -> Self {
         self.mode_config.commit_ack_mode = mode;
+        self
+    }
+
+    /// Set the logical schema version registered in the manifest catalog for this table.
+    #[must_use]
+    pub fn schema_version(mut self, version: u32) -> Self {
+        self.mode_config = self.mode_config.with_schema_version(version);
         self
     }
 }
@@ -1660,23 +1668,44 @@ where
         FS: ManifestFs<E>,
         <FS as fusio::fs::Fs>::File: fusio::durability::FileCommit,
     {
-        let snapshot = manifest
-            .snapshot_latest_with_fallback(table_meta.table_id, table_meta)
+        let mut table_ids = manifest
+            .list_tables()
             .await
             .map_err(DbBuildError::Manifest)?;
-        let next_id = match snapshot.latest_version.as_ref() {
-            Some(version) if !version.ssts().is_empty() => {
-                next_sstable_id(std::slice::from_ref(version))
-            }
-            _ => {
+        if !table_ids.contains(&table_meta.table_id) {
+            table_ids.push(table_meta.table_id);
+        }
+        let mut max_next_id = 1u64;
+        for table_id in table_ids {
+            let next_id = if table_id == table_meta.table_id {
+                let snapshot = manifest
+                    .snapshot_latest_with_fallback(table_meta.table_id, table_meta)
+                    .await
+                    .map_err(DbBuildError::Manifest)?;
+                match snapshot.latest_version.as_ref() {
+                    Some(version) if !version.ssts().is_empty() => {
+                        next_sstable_id(std::slice::from_ref(version))
+                    }
+                    _ => {
+                        let versions = manifest
+                            .list_versions(table_meta.table_id, 0)
+                            .await
+                            .map_err(DbBuildError::Manifest)?;
+                        next_sstable_id(&versions)
+                    }
+                }
+            } else {
                 let versions = manifest
-                    .list_versions(table_meta.table_id, 0)
+                    .list_versions(table_id, 0)
                     .await
                     .map_err(DbBuildError::Manifest)?;
                 next_sstable_id(&versions)
+            };
+            if next_id > max_next_id {
+                max_next_id = next_id;
             }
-        };
-        Ok(Arc::new(AtomicU64::new(next_id)))
+        }
+        Ok(Arc::new(AtomicU64::new(max_next_id)))
     }
 
     /// Internal: recover from WAL state if present, otherwise build fresh.
@@ -1779,6 +1808,7 @@ where
             if let (Some(options), Some((sst_config, id_allocator))) =
                 (compaction_options, compaction_state)
             {
+                inner.compaction_sst_config = Some(Arc::clone(&sst_config));
                 let planner = options.strategy.clone().build();
                 let mut exec = LocalCompactionExecutor::with_id_allocator(
                     Arc::clone(&sst_config),

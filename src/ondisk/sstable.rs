@@ -55,6 +55,7 @@ use crate::{
     },
     key::{KeyOwned, KeyOwnedError},
     manifest::ManifestError,
+    mode::adapt_record_batch_to_schema,
     mvcc::Timestamp,
     ondisk::{
         merge::{decode_delete_sidecar, extract_delete_key_at, extract_key_at},
@@ -92,6 +93,7 @@ pub const DEFAULT_MAX_ROW_GROUP_ROWS: usize = 1024 * 1024;
 #[derive(Clone)]
 pub struct SsTableConfig {
     schema: SchemaRef,
+    evolved_schema: Arc<parking_lot::RwLock<Option<SchemaRef>>>,
     target_level: usize,
     compression: SsTableCompression,
     fs: Arc<dyn DynFs>,
@@ -106,6 +108,7 @@ impl SsTableConfig {
     pub fn new(schema: SchemaRef, fs: Arc<dyn DynFs>, root: Path) -> Self {
         Self {
             schema,
+            evolved_schema: Arc::new(parking_lot::RwLock::new(None)),
             target_level: 0,
             compression: SsTableCompression::default(),
             fs,
@@ -131,6 +134,19 @@ impl SsTableConfig {
     /// Access the Arrow schema used by this table.
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    /// Access the latest evolved Arrow schema used by this table.
+    pub(crate) fn current_schema(&self) -> SchemaRef {
+        self.evolved_schema
+            .read()
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.schema))
+    }
+
+    /// Update the active Arrow schema used for new SSTable flushes and compaction merges.
+    pub(crate) fn set_schema(&self, schema: SchemaRef) {
+        *self.evolved_schema.write() = Some(schema);
     }
 
     /// Access the target level hint used when enqueuing this table into the version set.
@@ -568,7 +584,9 @@ impl ParquetTableWriter {
         self.staged.rows += data_rows;
         self.staged.tombstones += segment_tombstones;
         let mvcc = segment.mvcc_columns().clone();
-        let data_with_commit = append_commit_column(segment.storage().clone(), &mvcc)?;
+        let current_schema = self.config.current_schema();
+        let adapted_storage = adapt_record_batch_to_schema(segment.storage(), &current_schema)?;
+        let data_with_commit = append_commit_column(adapted_storage, &mvcc)?;
         let staged_segment = StagedSegment {
             data_with_commit,
             deletes: segment.delete_sidecar().clone(),
@@ -904,7 +922,7 @@ fn bloom_filter_columns(config: &SsTableConfig, schema: &SchemaRef) -> Vec<Colum
     let Some(extractor) = config.key_extractor() else {
         return Vec::new();
     };
-    let base_schema = config.schema();
+    let base_schema = config.current_schema();
     extractor
         .key_indices()
         .iter()
@@ -1024,11 +1042,12 @@ where
         let data_file = fs.open_options(&data_path, data_options).await?;
 
         // Extend user schema with commit_ts for on-disk persistence, preserving metadata.
-        let mut fields = config.schema().fields().to_vec();
+        let current_schema = config.current_schema();
+        let mut fields = current_schema.fields().to_vec();
         fields.push(Field::new(MVCC_COMMIT_COL, DataType::UInt64, false).into());
         let data_schema = Arc::new(Schema::new_with_metadata(
             fields,
-            config.schema().metadata().clone(),
+            current_schema.metadata().clone(),
         ));
 
         let data_properties = writer_properties(config.as_ref(), &data_schema);
@@ -1301,11 +1320,17 @@ impl SsTableReader {
             None
         };
 
-        let schema = self.config.schema().clone();
+        let current_schema = self.config.current_schema();
+        let mut data_fields = current_schema.fields().to_vec();
+        data_fields.push(Field::new(MVCC_COMMIT_COL, DataType::UInt64, false).into());
+        let target_data_schema = Arc::new(Schema::new_with_metadata(
+            data_fields,
+            current_schema.metadata().clone(),
+        ));
         let stream = stream::try_unfold(
             (data_stream, delete_stream),
             move |(mut data_stream, mut delete_stream)| {
-                let schema = schema.clone();
+                let target_data_schema = target_data_schema.clone();
                 async move {
                     // ParquetStream<E> is Unpin, so .next() works directly
                     let data_batch = data_stream
@@ -1326,11 +1351,12 @@ impl SsTableReader {
                     match (data_batch, delete_batch) {
                         (None, None) => Ok(None),
                         (Some(data), delete) => {
+                            let data = adapt_record_batch_to_schema(&data, &target_data_schema)?;
                             let next_state = (data_stream, delete_stream);
                             Ok(Some((SsTableStreamBatch { data, delete }, next_state)))
                         }
                         (None, Some(delete)) => {
-                            let empty_data = RecordBatch::new_empty(schema.clone());
+                            let empty_data = RecordBatch::new_empty(target_data_schema.clone());
                             let next_state = (data_stream, delete_stream);
                             Ok(Some((
                                 SsTableStreamBatch {

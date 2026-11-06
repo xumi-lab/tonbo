@@ -19,4 +19,7 @@
 #[cfg(feature = "typed-arrow")]
 pub use typed_arrow::{self, Record, prelude::*, schema::SchemaMeta};
 
-pub use crate::db::{BatchesThreshold, CommitAckMode, DB, DbBuilder, Expr, ScalarValue};
+pub use crate::{
+    db::{BatchesThreshold, CommitAckMode, DB, DbBuilder, Expr, ScalarValue},
+    schema::TONBO_FIELD_ID_META_KEY,
+};

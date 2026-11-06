@@ -33,17 +33,16 @@ where
 {
 }
 
+pub(crate) use bootstrap::TableSnapshot;
+pub use bootstrap::TonboManifest;
 #[cfg(all(test, feature = "tokio"))]
 pub(crate) use bootstrap::init_fs_manifest_in_memory;
 #[cfg(test)]
 pub(crate) use bootstrap::init_in_memory_manifest;
-pub(crate) use bootstrap::{TableSnapshot, TonboManifest};
 #[cfg(all(test, feature = "tokio"))]
 pub(crate) use domain::TableHead;
-pub use domain::VersionState;
-pub(crate) use domain::{
-    GcPlanState, GcSstRef, SstEntry, TableDefinition, TableId, TableMeta, WalSegmentRef,
-};
+pub(crate) use domain::{GcPlanState, GcSstRef, SstEntry, TableDefinition, WalSegmentRef};
+pub use domain::{TableId, TableMeta, VersionState};
 pub use driver::ManifestError;
 pub(crate) use driver::ManifestResult;
 pub(crate) use version::VersionEdit;

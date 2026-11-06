@@ -406,9 +406,8 @@ pub(crate) struct TableCatalogEntry {
 }
 
 /// Static metadata for a Tonbo table.
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TableMeta {
+pub struct TableMeta {
     /// Identifier of the table.
     pub table_id: TableId,
     /// Human-readable name of the table.

@@ -17,7 +17,10 @@ use pin_project_lite::pin_project;
 use thiserror::Error;
 use typed_arrow_dyn::{DynBuilders, DynProjection, DynRow, DynSchema};
 
-use crate::query::stream::{StreamError, merge::MergeStream};
+use crate::{
+    mode::schema_projection_indices,
+    query::stream::{StreamError, merge::MergeStream},
+};
 
 pin_project! {
     /// Stream adapter that batches merged rows into `RecordBatch` chunks.
@@ -82,10 +85,15 @@ where
         let projection = if scan_schema.as_ref() == result_schema.as_ref() {
             None
         } else {
-            Some(DynProjection::from_schema(
-                scan_schema.as_ref(),
-                result_schema.as_ref(),
-            )?)
+            let indices =
+                schema_projection_indices(&scan_schema, &result_schema).map_err(|err| {
+                    StreamError::from(typed_arrow_dyn::DynViewError::Invalid {
+                        column: 0,
+                        path: "package_projection".to_string(),
+                        message: err.to_string(),
+                    })
+                })?;
+            Some(DynProjection::from_indices(scan_schema.as_ref(), indices)?)
         };
         Ok(Self {
             row_count: 0,

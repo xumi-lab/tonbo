@@ -73,7 +73,7 @@ impl TableSnapshot {
 ///
 /// This struct bundles three manifest instances (version, catalog, gc_plan) sharing
 /// the same filesystem and executor types for static dispatch.
-pub(crate) struct TonboManifest<FS, E>
+pub struct TonboManifest<FS, E>
 where
     FS: ManifestFs<E>,
     E: Executor + Timer + Clone + 'static,
@@ -175,6 +175,11 @@ where
 
     pub(crate) async fn wal_floor(&self, table: TableId) -> ManifestResult<Option<WalSegmentRef>> {
         self.version.wal_floor(table).await
+    }
+
+    /// List all registered table identifiers in the catalog.
+    pub async fn list_tables(&self) -> ManifestResult<Vec<TableId>> {
+        self.catalog.list_tables().await
     }
 
     async fn init_table_head(&self, table_id: TableId, head: TableHead) -> ManifestResult<()> {

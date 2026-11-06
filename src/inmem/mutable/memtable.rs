@@ -28,6 +28,7 @@ use crate::{
         policy::{MemStats, StatsProvider},
     },
     key::{KeyOwned, KeyTsOwned, KeyTsViewRaw},
+    mode::{adapt_record_batch_to_schema, schema_projection_indices},
     mutation::DynMutation,
     mvcc::Timestamp,
 };
@@ -599,7 +600,7 @@ pub struct DynMem {
     inner: RwLock<DynMemInner>,
     extractor: Arc<dyn KeyProjection>,
     delete_projection: Arc<dyn KeyProjection>,
-    schema: SchemaRef,
+    schema: RwLock<SchemaRef>,
     capacity: usize,
 }
 
@@ -624,9 +625,34 @@ impl DynMem {
             inner: RwLock::new(DynMemInner::new(capacity)),
             extractor,
             delete_projection,
-            schema,
+            schema: RwLock::new(schema),
             capacity,
         }
+    }
+
+    /// Return the current schema of the mutable memtable.
+    pub(crate) fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema.read())
+    }
+
+    /// Evolve the mutable memtable schema in place, adapting any already-buffered batches by
+    /// backfilling newly added nullable columns with null arrays.
+    pub(crate) fn evolve_schema(&self, new_schema: SchemaRef) -> Result<(), KeyExtractError> {
+        self.extractor.validate_schema(&new_schema)?;
+        let mut inner = self.inner.write();
+        let mut schema_guard = self.schema.write();
+        let cursor = inner
+            .batch_cursor
+            .load(Ordering::SeqCst)
+            .min(inner.batch_slots.len());
+        for slot in &mut inner.batch_slots[..cursor] {
+            if let Some(attachment) = slot.get_mut() {
+                attachment.storage =
+                    adapt_record_batch_to_schema(&attachment.storage, &new_schema)?;
+            }
+        }
+        *schema_guard = new_schema;
+        Ok(())
     }
 
     /// Acquire a read guard for scanning operations.
@@ -637,7 +663,7 @@ impl DynMem {
     pub(crate) fn read(&self) -> DynMemReadGuard<'_> {
         DynMemReadGuard {
             guard: self.inner.read(),
-            schema: &self.schema,
+            schema: self.schema(),
         }
     }
 
@@ -693,9 +719,10 @@ impl DynMem {
 
         // Upgrade to write lock atomically (no other thread can interleave)
         let mut write_guard = RwLockUpgradableReadGuard::upgrade(guard);
+        let current_schema = self.schema();
 
         // Seal the current state
-        let sealed = write_guard.seal(&self.schema, self.extractor.as_ref())?;
+        let sealed = write_guard.seal(&current_schema, self.extractor.as_ref())?;
 
         // Now retry the insert on the fresh state
         match write_guard.try_insert_batch(self.extractor.as_ref(), batch, commit_ts_column) {
@@ -731,7 +758,8 @@ impl DynMem {
         }
 
         let mut write_guard = RwLockUpgradableReadGuard::upgrade(guard);
-        let sealed = write_guard.seal(&self.schema, self.extractor.as_ref())?;
+        let current_schema = self.schema();
+        let sealed = write_guard.seal(&current_schema, self.extractor.as_ref())?;
 
         match write_guard.try_insert_delete_batch(self.delete_projection.as_ref(), batch) {
             Ok(Ok(())) => Ok(sealed),
@@ -747,7 +775,8 @@ impl DynMem {
     /// Returns `None` if the memtable was empty.
     pub(crate) fn seal_now(&self) -> Result<Option<ImmutableMemTable>, KeyExtractError> {
         let mut guard = self.inner.write();
-        guard.seal(&self.schema, self.extractor.as_ref())
+        let current_schema = self.schema();
+        guard.seal(&current_schema, self.extractor.as_ref())
     }
 
     /// Return `true` if there is any committed version for `key` newer than `snapshot_ts`.
@@ -806,7 +835,7 @@ impl DynMem {
 /// Guard providing read access to the memtable's inner state.
 pub struct DynMemReadGuard<'a> {
     guard: RwLockReadGuard<'a, DynMemInner>,
-    schema: &'a SchemaRef,
+    schema: SchemaRef,
 }
 
 impl<'a> DynMemReadGuard<'a> {
@@ -817,7 +846,7 @@ impl<'a> DynMemReadGuard<'a> {
         read_ts: Timestamp,
     ) -> Result<DynRowScan<'_>, KeyExtractError> {
         self.guard
-            .scan_visible(self.schema, projection_schema, read_ts)
+            .scan_visible(&self.schema, projection_schema, read_ts)
     }
 
     /// Scan dynamic rows within a key range using MVCC visibility semantics at `read_ts`.
@@ -829,7 +858,7 @@ impl<'a> DynMemReadGuard<'a> {
         end: Bound<KeyOwned>,
     ) -> Result<DynRowScan<'_>, KeyExtractError> {
         self.guard
-            .scan_visible_in_range(self.schema, projection_schema, read_ts, start, end)
+            .scan_visible_in_range(&self.schema, projection_schema, read_ts, start, end)
     }
 }
 
@@ -870,7 +899,8 @@ fn build_projection(
                 ),
             ));
         }
-        DynProjection::from_schema(schema.as_ref(), projected.as_ref()).map_err(map_view_err)
+        let indices = schema_projection_indices(schema, projected)?;
+        DynProjection::from_indices(schema.as_ref(), indices).map_err(map_view_err)
     } else {
         DynProjection::from_schema(schema.as_ref(), schema.as_ref()).map_err(map_view_err)
     }

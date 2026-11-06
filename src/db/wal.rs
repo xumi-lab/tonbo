@@ -476,8 +476,12 @@ where
     <FS as fusio::fs::Fs>::File: fusio::durability::FileCommit,
 {
     let total_started = Instant::now();
-    validate_record_batch_schema(db, &batch)?;
     validate_vec_tombstone_bitmap(&batch, &tombstones)?;
+    let batch = crate::mode::align_ingest_batch_to_schema(
+        batch,
+        &db.current_schema(),
+        &db.extractor().key_schema(),
+    )?;
 
     if batch.num_rows() == 0 {
         return Ok(WritePathProfile {
@@ -611,8 +615,8 @@ where
     E: Executor + Timer + Clone,
     <FS as fusio::fs::Fs>::File: fusio::durability::FileCommit,
 {
-    let schema_contains_tombstone = db
-        .schema
+    let current_schema = db.current_schema();
+    let schema_contains_tombstone = current_schema
         .fields()
         .iter()
         .any(|field| field.name() == crate::inmem::immutable::memtable::MVCC_TOMBSTONE_COL);
@@ -626,7 +630,11 @@ where
             "wal batch contained unexpected _tombstone column".into(),
         )));
     }
-    validate_record_batch_schema(db, &batch)?;
+    let batch = crate::mode::align_ingest_batch_to_schema(
+        batch,
+        &current_schema,
+        &db.extractor().key_schema(),
+    )?;
     let commit_array = commit_ts_column
         .as_any()
         .downcast_ref::<UInt64Array>()
@@ -668,24 +676,6 @@ where
     if let Some(sealed) = db.mem.insert_delete_batch(batch)? {
         let wal_range = db.take_mutable_wal_range();
         db.add_immutable(sealed, wal_range);
-    }
-    Ok(())
-}
-
-fn validate_record_batch_schema<FS, E>(
-    db: &DbInner<FS, E>,
-    batch: &RecordBatch,
-) -> Result<(), KeyExtractError>
-where
-    FS: ManifestFs<E>,
-    E: Executor + Timer + Clone,
-    <FS as fusio::fs::Fs>::File: fusio::durability::FileCommit,
-{
-    if db.schema.as_ref() != batch.schema().as_ref() {
-        return Err(KeyExtractError::SchemaMismatch {
-            expected: db.schema.clone(),
-            actual: batch.schema(),
-        });
     }
     Ok(())
 }

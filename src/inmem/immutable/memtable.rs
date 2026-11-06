@@ -8,6 +8,7 @@ pub(crate) use crate::mvcc::MVCC_COMMIT_COL;
 use crate::{
     extractor::{KeyExtractError, map_view_err},
     key::{KeyOwned, KeyRow, KeyTsViewRaw},
+    mode::{adapt_record_batch_to_schema, schema_projection_indices},
     mvcc::Timestamp,
 };
 
@@ -109,6 +110,19 @@ impl ImmutableMemTable {
 
     pub(crate) fn storage(&self) -> &RecordBatch {
         &self.storage
+    }
+
+    pub(crate) fn with_adapted_schema(
+        &self,
+        new_schema: &SchemaRef,
+    ) -> Result<Self, KeyExtractError> {
+        let adapted_storage = adapt_record_batch_to_schema(&self.storage, new_schema)?;
+        Ok(Self {
+            storage: adapted_storage,
+            index: self.index.clone(),
+            mvcc: self.mvcc.clone(),
+            deletes: self.deletes.clone(),
+        })
     }
 
     pub(crate) fn delete_sidecar(&self) -> &DeleteSidecar {
@@ -427,8 +441,8 @@ fn build_projection(
                 ),
             ));
         }
-        return DynProjection::from_schema(schema.as_ref(), projected.as_ref())
-            .map_err(map_view_err);
+        let indices = schema_projection_indices(schema, projected)?;
+        return DynProjection::from_indices(schema.as_ref(), indices).map_err(map_view_err);
     }
 
     let logical_fields: Vec<_> = schema
@@ -450,7 +464,8 @@ fn build_projection(
     }
 
     let logical_schema = SchemaRef::new(Schema::new(logical_fields));
-    DynProjection::from_schema(schema.as_ref(), logical_schema.as_ref()).map_err(map_view_err)
+    let indices = schema_projection_indices(schema, &logical_schema)?;
+    DynProjection::from_indices(schema.as_ref(), indices).map_err(map_view_err)
 }
 
 pub(crate) struct ImmutableRowIter {

@@ -32,7 +32,7 @@ use crate::{
         mutable::memtable::DynRowScanEntry,
     },
     key::{KeyOwned, KeyRow},
-    mode::fingerprint_schema,
+    mode::{find_matching_field_index, fingerprint_schema, schema_projection_indices},
     mutation::DynMutation,
     mvcc::{MVCC_COMMIT_COL, Timestamp},
     ondisk::{
@@ -202,10 +202,11 @@ impl TxSnapshot {
                 ),
             });
         }
+        let current_schema = db.current_schema();
         let projected_schema = projected_schema.cloned();
-        let projection_schema = projected_schema.as_ref().unwrap_or(&db.schema);
+        let projection_schema = projected_schema.as_ref().unwrap_or(&current_schema);
         let predicate_scan_schema =
-            projection_with_predicate(&db.schema, projection_schema, Some(predicate))?;
+            projection_with_predicate(&current_schema, projection_schema, Some(predicate))?;
         let split = split_predicate_for_row_filter(predicate, &predicate_scan_schema);
         let mut pushdown_predicate = split.pushdown;
         let mut residual_predicate = split.residual;
@@ -395,14 +396,17 @@ where
     let arrow_metadata = ArrowReaderMetadata::try_new(Arc::clone(&metadata), options)
         .map_err(SsTableError::Parquet)?;
     let schema = arrow_metadata.schema();
-    let requires_residual = split_predicate_for_row_filter(predicate, schema)
-        .residual
-        .is_some();
+    let (sanitized_predicate, dropped_for_sst) =
+        sanitize_predicate_for_sst_schema(predicate, scan_schema, None, schema);
+    let requires_residual = dropped_for_sst
+        || split_predicate_for_row_filter(&sanitized_predicate, schema)
+            .residual
+            .is_some();
     let commit_predicate = Expr::lt_eq(MVCC_COMMIT_COL, ScalarValue::UInt64(Some(read_ts.get())));
-    let prune_predicate = if matches!(predicate, Expr::True) {
+    let prune_predicate = if matches!(sanitized_predicate, Expr::True) {
         commit_predicate
     } else {
-        Expr::and(vec![predicate.clone(), commit_predicate])
+        Expr::and(vec![sanitized_predicate, commit_predicate])
     };
     let bloom_file = ctx.fs.open(data_path).await.map_err(SsTableError::Fs)?;
     let size = bloom_file.size().await.map_err(SsTableError::Fs)?;
@@ -489,35 +493,175 @@ fn sst_projection_from_metadata(
     scan_schema: &SchemaRef,
     key_schema: &SchemaRef,
 ) -> Result<(ProjectionMask, SchemaRef), SsTableError> {
-    let mut required = BTreeSet::new();
-    for field in scan_schema.fields() {
-        required.insert(field.name().to_string());
-    }
-    for field in key_schema.fields() {
-        required.insert(field.name().to_string());
-    }
-    required.insert(MVCC_COMMIT_COL.to_string());
+    let file_schema = arrow_metadata.schema();
+    let mut root_indices_set = BTreeSet::new();
+    let mut missing_fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
 
-    let mut remaining = required;
-    let mut projected_fields = Vec::new();
-    let mut root_indices = Vec::new();
-    for (idx, field) in arrow_metadata.schema().fields().iter().enumerate() {
-        if remaining.remove(field.name()) {
-            projected_fields.push(field.clone());
-            root_indices.push(idx);
+    // Primary key columns must physically exist in every SSTable.
+    for key_field in key_schema.fields() {
+        let Some(idx) = find_matching_field_index(file_schema.as_ref(), key_field.as_ref()) else {
+            return Err(KeyExtractError::NoSuchField {
+                name: key_field.name().to_string(),
+            }
+            .into());
+        };
+        root_indices_set.insert(idx);
+    }
+
+    // Scan schema columns: include physical root index if present in this SSTable, or record for
+    // Schema-on-Read null backfilling if absent (written prior to schema evolution).
+    for scan_field in scan_schema.fields() {
+        if let Some(idx) = find_matching_field_index(file_schema.as_ref(), scan_field.as_ref()) {
+            if file_schema.field(idx).data_type() != scan_field.data_type() {
+                return Err(KeyExtractError::WrongType {
+                    col: idx,
+                    expected: scan_field.data_type().clone(),
+                    actual: file_schema.field(idx).data_type().clone(),
+                }
+                .into());
+            }
+            root_indices_set.insert(idx);
+        } else if !missing_fields.iter().any(|existing| {
+            find_matching_field_index(
+                &Schema::new(vec![existing.as_ref().clone()]),
+                scan_field.as_ref(),
+            )
+            .is_some()
+        }) {
+            missing_fields.push(Arc::new(scan_field.as_ref().clone().with_nullable(true)));
         }
     }
 
-    if let Some(missing) = remaining.iter().next() {
+    // `_commit_ts` must physically exist in every SSTable.
+    let Some(commit_idx) = file_schema
+        .fields()
+        .iter()
+        .position(|field| field.name() == MVCC_COMMIT_COL)
+    else {
         return Err(KeyExtractError::NoSuchField {
-            name: missing.to_string(),
+            name: MVCC_COMMIT_COL.to_string(),
         }
         .into());
-    }
+    };
+    root_indices_set.insert(commit_idx);
+
+    let root_indices: Vec<usize> = root_indices_set.into_iter().collect();
+    let mut projected_fields: Vec<Arc<arrow_schema::Field>> = root_indices
+        .iter()
+        .map(|&idx| Arc::clone(&file_schema.fields()[idx]))
+        .collect();
+    projected_fields.extend(missing_fields);
 
     let projected_schema = Arc::new(Schema::new(projected_fields));
     let projection = ProjectionMask::roots(arrow_metadata.parquet_schema(), root_indices);
     Ok((projection, projected_schema))
+}
+
+fn expr_column_compatible_with_sst(
+    column: &str,
+    scan_schema: &SchemaRef,
+    fallback_schema: Option<&SchemaRef>,
+    sst_schema: &SchemaRef,
+) -> bool {
+    if column == MVCC_COMMIT_COL {
+        return sst_schema
+            .fields()
+            .iter()
+            .any(|field| field.name() == MVCC_COMMIT_COL);
+    }
+    let target_field = scan_schema
+        .fields()
+        .iter()
+        .rev()
+        .find(|field| field.name() == column)
+        .or_else(|| {
+            fallback_schema.and_then(|schema| {
+                schema
+                    .fields()
+                    .iter()
+                    .rev()
+                    .find(|field| field.name() == column)
+            })
+        });
+    let Some(target_field) = target_field else {
+        return false;
+    };
+    let Some(sst_idx) = find_matching_field_index(sst_schema.as_ref(), target_field.as_ref())
+    else {
+        return false;
+    };
+    let sst_field = sst_schema.field(sst_idx);
+    sst_field.name() == column && sst_field.data_type() == target_field.data_type()
+}
+
+fn all_expr_columns_compatible_with_sst(
+    expr: &Expr,
+    scan_schema: &SchemaRef,
+    fallback_schema: Option<&SchemaRef>,
+    sst_schema: &SchemaRef,
+) -> bool {
+    match expr {
+        Expr::True | Expr::False => true,
+        Expr::Cmp { column, .. }
+        | Expr::Between { column, .. }
+        | Expr::InList { column, .. }
+        | Expr::StartsWith { column, .. }
+        | Expr::IsNull { column, .. }
+        | Expr::BloomFilterEq { column, .. }
+        | Expr::BloomFilterInList { column, .. } => {
+            expr_column_compatible_with_sst(column, scan_schema, fallback_schema, sst_schema)
+        }
+        Expr::Not(child) => {
+            all_expr_columns_compatible_with_sst(child, scan_schema, fallback_schema, sst_schema)
+        }
+        Expr::And(children) | Expr::Or(children) => children.iter().all(|child| {
+            all_expr_columns_compatible_with_sst(child, scan_schema, fallback_schema, sst_schema)
+        }),
+        _ => false,
+    }
+}
+
+fn sanitize_predicate_for_sst_schema(
+    predicate: &Expr,
+    scan_schema: &SchemaRef,
+    fallback_schema: Option<&SchemaRef>,
+    sst_schema: &SchemaRef,
+) -> (Expr, bool) {
+    match predicate {
+        Expr::True | Expr::False => (predicate.clone(), false),
+        Expr::And(children) => {
+            let mut kept = Vec::with_capacity(children.len());
+            let mut dropped_any = false;
+            for child in children {
+                let (sanitized, dropped) = sanitize_predicate_for_sst_schema(
+                    child,
+                    scan_schema,
+                    fallback_schema,
+                    sst_schema,
+                );
+                if dropped {
+                    dropped_any = true;
+                }
+                if !matches!(sanitized, Expr::True) {
+                    kept.push(sanitized);
+                }
+            }
+            let combined = match kept.len() {
+                0 => Expr::True,
+                1 => kept.pop().unwrap_or(Expr::True),
+                _ => Expr::And(kept),
+            };
+            (combined, dropped_any)
+        }
+        other => {
+            if all_expr_columns_compatible_with_sst(other, scan_schema, fallback_schema, sst_schema)
+            {
+                (other.clone(), false)
+            } else {
+                (Expr::True, true)
+            }
+        }
+    }
 }
 
 fn reproject_sst_selection(
@@ -533,27 +677,6 @@ fn reproject_sst_selection(
     selection.projection = projection;
     selection.projected_schema = projected_schema;
     Ok(())
-}
-
-fn schema_projection_indices(
-    base_schema: &SchemaRef,
-    target_schema: &SchemaRef,
-) -> Result<Vec<usize>, KeyExtractError> {
-    let mut indices = Vec::with_capacity(target_schema.fields().len());
-    for field in target_schema.fields() {
-        let Some((idx, _)) = base_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .find(|(_, candidate)| candidate.name() == field.name())
-        else {
-            return Err(KeyExtractError::NoSuchField {
-                name: field.name().to_string(),
-            });
-        };
-        indices.push(idx);
-    }
-    Ok(indices)
 }
 
 async fn plan_delete_sidecar_selection<E>(
@@ -617,7 +740,7 @@ where
         let result_projection = plan
             .projected_schema
             .clone()
-            .unwrap_or_else(|| Arc::clone(&self.schema));
+            .unwrap_or_else(|| self.current_schema());
         let scan_schema = Arc::clone(&plan.scan_schema);
         let streams = self.build_scan_streams(&plan, None).await?;
 
@@ -667,6 +790,7 @@ where
             streams.push(ScanStream::from(txn_scan));
         }
         let scan_schema = Arc::clone(&plan.scan_schema);
+        let current_schema = self.current_schema();
         let key_schema = self.extractor().key_schema();
         if !plan.mutable_row_set.is_empty() {
             let mutable_scan = match &plan.mutable_selection {
@@ -737,13 +861,26 @@ where
             let projection_indices = schema_projection_indices(&projected_schema, &scan_schema)?;
             let key_indices = schema_projection_indices(&projected_schema, &key_schema)?;
             let data_extractor: Arc<dyn KeyProjection> =
-                projection_for_columns(projected_schema, key_indices)?.into();
+                projection_for_columns(Arc::clone(&projected_schema), key_indices)?.into();
+
+            let sst_row_filter = plan.pushdown_predicate.as_ref().and_then(|pred| {
+                let options = ArrowReaderOptions::new().with_page_index(true);
+                let arrow_metadata =
+                    ArrowReaderMetadata::try_new(Arc::clone(&selection.metadata), options).ok()?;
+                let (sanitized, _) = sanitize_predicate_for_sst_schema(
+                    pred,
+                    &scan_schema,
+                    Some(&current_schema),
+                    arrow_metadata.schema(),
+                );
+                (!matches!(sanitized, Expr::True)).then_some(sanitized)
+            });
 
             let options = ParquetStreamOptions {
                 projection: Some(selection.projection.clone()),
                 row_groups: selection.row_groups.clone(),
                 row_selection: selection.row_set.to_row_selection(),
-                row_filter_predicate: plan.pushdown_predicate.as_ref(),
+                row_filter_predicate: sst_row_filter.as_ref(),
             };
             let data_stream = open_parquet_stream_with_metadata(
                 Arc::clone(&self.fs),
@@ -800,7 +937,8 @@ where
                 projection_indices,
                 Some(Order::Asc),
                 plan.read_ts,
-            );
+            )
+            .with_target_batch_schema(projected_schema);
 
             streams.push(ScanStream::from(sstable_scan));
         }
@@ -1160,7 +1298,7 @@ where
     let result_projection = plan
         .projected_schema
         .clone()
-        .unwrap_or_else(|| Arc::clone(&db.schema));
+        .unwrap_or_else(|| db.current_schema());
     let scan_schema = Arc::clone(&plan.scan_schema);
     let build_streams_started = Instant::now();
     let streams = db.build_scan_streams(&plan, txn_scan).await?;
